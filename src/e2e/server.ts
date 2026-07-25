@@ -17,6 +17,10 @@ export interface StartServerOptions {
   logLevel?: number
 }
 
+// `nuxi _dev` expects a supervisor: unsupervised, a restart request just ends
+// the process cleanly mid-startup.
+const MAX_DEV_SERVER_RESTARTS = 2
+
 export async function startServer(options: StartServerOptions = {}) {
   const ctx = useTestContext()
   await stopServer()
@@ -27,71 +31,82 @@ export async function startServer(options: StartServerOptions = {}) {
   const capture = ctx.options.captureServerLogs !== false
   const stdio = capture ? 'pipe' : 'inherit'
   const logLevel = String(options.logLevel ?? ctx.options.logLevel)
-  if (ctx.options.dev) {
-    ctx.serverProcess = x('nuxi', ['_dev'], {
-      throwOnError: true,
-      nodeOptions: {
-        cwd: ctx.nuxt!.options.rootDir,
-        stdio,
-        env: {
-          ...process.env,
-          _PORT: String(port), // Used by internal _dev command
-          PORT: String(port),
-          HOST: host,
-          NODE_ENV: 'development',
-          CONSOLA_LEVEL: logLevel,
-          ...ctx.options.env,
-          ...options.env,
-        },
-      },
-    })
-  }
-  else {
-    // The `nitro` property is augmented onto NuxtOptions/NuxtConfig by
-    // `@nuxt/nitro-server`, which isn't a direct dependency.
-    type WithNitroOutput = { nitro?: { output?: { dir?: string } } }
-    const outputDir = ctx.nuxt
-      ? (ctx.nuxt.options as WithNitroOutput).nitro!.output!.dir!
-      : (ctx.options.nuxtConfig as WithNitroOutput).nitro!.output!.dir!
-    ctx.serverProcess = x(
-      'node',
-      [resolve(outputDir, 'server/index.mjs')],
-      {
+  const spawnServer = () => {
+    if (ctx.options.dev) {
+      ctx.serverProcess = x('nuxi', ['_dev'], {
         throwOnError: true,
         nodeOptions: {
+          cwd: ctx.nuxt!.options.rootDir,
           stdio,
           env: {
             ...process.env,
+            _PORT: String(port), // Used by internal _dev command
             PORT: String(port),
             HOST: host,
-            NODE_ENV: 'test',
+            NODE_ENV: 'development',
             CONSOLA_LEVEL: logLevel,
             ...ctx.options.env,
             ...options.env,
           },
         },
-      },
-    )
+      })
+    }
+    else {
+      // The `nitro` property is augmented onto NuxtOptions/NuxtConfig by
+      // `@nuxt/nitro-server`, which isn't a direct dependency.
+      type WithNitroOutput = { nitro?: { output?: { dir?: string } } }
+      const outputDir = ctx.nuxt
+        ? (ctx.nuxt.options as WithNitroOutput).nitro!.output!.dir!
+        : (ctx.options.nuxtConfig as WithNitroOutput).nitro!.output!.dir!
+      ctx.serverProcess = x(
+        'node',
+        [resolve(outputDir, 'server/index.mjs')],
+        {
+          throwOnError: true,
+          nodeOptions: {
+            stdio,
+            env: {
+              ...process.env,
+              PORT: String(port),
+              HOST: host,
+              NODE_ENV: 'test',
+              CONSOLA_LEVEL: logLevel,
+              ...ctx.options.env,
+              ...options.env,
+            },
+          },
+        },
+      )
+    }
+
+    if (capture) {
+      ;(async () => {
+        for await (const line of ctx.serverProcess!) {
+          ctx.serverLogs.push(line)
+        }
+      })().catch(() => {})
+    }
   }
 
-  if (capture) {
-    ;(async () => {
-      for await (const line of ctx.serverProcess!) {
-        ctx.serverLogs.push(line)
-      }
-    })().catch(() => {})
-  }
+  spawnServer()
 
-  await waitForServer({ host, port, dev: ctx.options.dev })
+  await waitForServer({
+    host,
+    port,
+    dev: ctx.options.dev,
+    respawn: ctx.options.dev ? spawnServer : undefined,
+  })
 }
 
 interface WaitForServerOptions {
   host: string
   port: number
   dev: boolean
+  /** Restarts the dev server after it exits before becoming ready. */
+  respawn?: () => void
 }
 
-async function waitForServer({ host, port, dev }: WaitForServerOptions) {
+async function waitForServer({ host, port, dev, respawn }: WaitForServerOptions) {
   const ctx = useTestContext()
   const baseURL = ctx.nuxt?.options.app.baseURL ?? '/'
   const deadline = Date.now() + ctx.options.serverStartTimeout
@@ -100,9 +115,18 @@ async function waitForServer({ host, port, dev }: WaitForServerOptions) {
   await waitForPort(port, { retries: 8, host }).catch(() => {})
 
   let lastError: unknown
+  let restarts = 0
   while (Date.now() < deadline) {
     if (ctx.serverProcess && (ctx.serverProcess.killed || ctx.serverProcess.exitCode != null)) {
-      throw new Error(`Server process exited before becoming ready (exit code: ${ctx.serverProcess.exitCode ?? 'unknown'})`)
+      const exitCode = ctx.serverProcess.exitCode
+      // respawn within the same `serverStartTimeout` budget
+      if (respawn && !ctx.serverProcess.killed && exitCode === 0 && restarts < MAX_DEV_SERVER_RESTARTS) {
+        restarts++
+        respawn()
+        await new Promise(resolve => setTimeout(resolve, 100))
+        continue
+      }
+      throw new Error(`Server process exited before becoming ready (exit code: ${exitCode ?? 'unknown'})`)
     }
     try {
       const res = await globalFetch(joinURL(ctx.url!, baseURL), { signal: AbortSignal.timeout(10_000) })
